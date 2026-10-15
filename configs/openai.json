@@ -1,0 +1,11 @@
+{
+  "backend_base_url": "https://api.openai.com/v1",
+  "backend_name": "openai",
+  "wire_api": "responses",
+  "api_key_env": null,
+  "listen_host": "127.0.0.1",
+  "listen_port": 8135,
+  "log_dir": "codex_probe_logs",
+  "session_name": "openai",
+  "seed": 0
+}

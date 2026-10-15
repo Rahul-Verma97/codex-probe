@@ -1,0 +1,11 @@
+{
+  "backend_base_url": "http://127.0.0.1:11434/v1",
+  "backend_name": "local-qwen-ollama",
+  "wire_api": "responses",
+  "api_key_env": null,
+  "listen_host": "127.0.0.1",
+  "listen_port": 8136,
+  "log_dir": "codex_probe_logs",
+  "session_name": "qwen",
+  "seed": 0
+}
