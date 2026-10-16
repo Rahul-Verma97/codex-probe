@@ -157,14 +157,27 @@ It was also checked end-to-end with the real `codex exec` (codex-cli 0.162.1) th
 
 1. **`wire_api = "chat"` is gone.** Codex 0.162 refuses to start with it, so the local server must speak the Responses API. Ollama and vLLM both do.
 2. **Silent prompt truncation.** With Ollama's default 4k context, Codex's ~10k-token request was cut to 3,836 tokens before reaching Qwen. Nothing errors, and only the recorded `usage` shows it. Fixed with `num_ctx 32768` (above).
-3. **Qwen2.5-Coder-7B does not emit structured tool calls.** It writes the call as JSON inside a Markdown code block instead of the `<tool_call>` format the server parses, so Codex receives plain text, treats it as the final answer, and stops after one turn with exit code 0 while no file was created. This is the "tool-skip" failure mode described in recent tool-use failure studies. Codex's exit code therefore cannot be trusted as success; the quickstart re-runs the task's test itself.
-4. **Qwen3-Coder-30B** (trained for agentic tool use) is the same config change with a different model name; see the results table below.
+3. **Qwen2.5-Coder-7B does not emit structured tool calls.** It writes the call as JSON inside a Markdown code block instead of the `<tool_call>` format the server parses, so Codex receives plain text, treats it as the final answer, and stops after one turn with exit code 0 while no file was created. This still happens with the full 32k context, so truncation was not the cause. It is the "tool-skip" failure mode described in recent tool-use failure studies. Codex's exit code therefore cannot be trusted as success; the quickstart re-runs the task's test itself.
+4. **Qwen3-Coder-30B completes the task.** Same recorder, same config file, only the model name changes. It wrote `fizzbuzz.py`, wrote `test_fizzbuzz.py`, ran the tests, spot-checked edge cases and finished, all through real `function_call` items, every one served by the local Ollama server.
 
-| backend | model | LLM calls | structured tool calls | task solved |
+Kaggle, 2× T4, codex-cli 0.162.1, Ollama, task: write FizzBuzz and its test, then run it.
+
+| backend | model | LLM calls | structured tool calls | task solved (our own test run) |
 |---|---|---|---|---|
-| OpenAI | gpt-5-codex | to run (needs key) | | |
-| local Ollama | qwen2.5-coder:7b-32k | see notebook | | |
-| local Ollama | qwen3-coder:30b-32k | see notebook | | |
+| OpenAI | gpt-5-codex | not yet run (needs an API key) | | |
+| local Ollama | qwen2.5-coder:7b-32k | 1 | 0 (call written as text) | no |
+| local Ollama | qwen3-coder:30b-32k | 6 | 5 `exec_command` | yes |
+
+`codex-probe show` on the Qwen3 session:
+
+```
+#0 output=['message', "exec_command(cat > fizzbuzz.py << 'EOF' ...)"]
+#1 output=['message', "exec_command(cat > test_fizzbuzz.py << 'EOF' ...)"]
+#2 output=['message', 'exec_command(python test_fizzbuzz.py)']
+#3 output=['message', 'exec_command(python -c "from fizzbuzz import fizzbuzz; print(fizzbuzz(15)) ...")']
+#4 output=['message', 'exec_command(python -c "... fizzbuzz(0) ...")']
+#5 output=['message']                      <- final answer
+```
 
 ## Known limitations
 
