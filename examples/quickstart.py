@@ -79,8 +79,11 @@ def main() -> None:
     print(f"\n[probe] {len(calls)} calls -> {recorder.log_path}")
     for c in calls:
         print("  " + summarize(c))
-    solved = subprocess.run(CHECK, shell=True, cwd=workdir, capture_output=True).returncode == 0
-    outcome = {"model": args.model, "calls": len(calls), "files": sorted(p.name for p in workdir.iterdir()),
+    tests = sorted(workdir.rglob("test_fizzbuzz.py"))          # the agent may use a subfolder
+    solved = bool(tests) and subprocess.run(CHECK, shell=True, cwd=tests[0].parent,
+                                            capture_output=True).returncode == 0
+    outcome = {"model": args.model, "calls": len(calls),
+               "files": sorted(str(p.relative_to(workdir)) for p in workdir.rglob("*") if p.is_file()),
                "task_solved": solved, "upstreams": sorted({c["upstream_url"] for c in calls})}
     recorder.log_path.with_suffix(".outcome.json").write_text(json.dumps(outcome, indent=2))
     print(json.dumps(outcome, indent=2))

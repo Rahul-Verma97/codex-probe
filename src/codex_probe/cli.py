@@ -22,7 +22,13 @@ def summarize(entry: dict[str, Any]) -> str:
     resp = entry.get("response_body") if isinstance(entry.get("response_body"), dict) else {}
     out = []
     for item in resp.get("output") or []:                                   # Responses API
-        out.append(item.get("name") or item.get("type", "?"))
+        label = item.get("name") or item.get("type", "?")
+        if item.get("type") == "function_call":                             # show the command it ran
+            try:
+                label += f"({json.loads(item.get('arguments') or '{}').get('cmd', '')!s:.60})"
+            except (json.JSONDecodeError, AttributeError):
+                label += "(<unparseable arguments>)"
+        out.append(label)
     for choice in resp.get("choices") or []:                                # Chat Completions
         msg = choice.get("message") or {}
         out += [tc["function"]["name"] for tc in msg.get("tool_calls") or []] or ["message"]
