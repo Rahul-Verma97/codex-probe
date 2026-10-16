@@ -33,10 +33,9 @@ Or from the shell:
 ```bash
 codex-probe serve --config configs/openai.json          # runs until Ctrl+C
 codex-probe show codex_probe_logs/<session>.jsonl       # turn-by-turn summary (--full for raw JSON)
-codex-probe analyze openai-….jsonl qwen-….jsonl --names openai qwen --out comparison.md --json comparison.json
 ```
 
-`examples/quickstart.py` does the whole loop (start the recorder → write a temporary Codex config → `codex exec` a small FizzBuzz task → print what was captured → independently re-run the task's test and write `<session>.outcome.json`). `examples/kaggle_codex_probe.ipynb` runs both the OpenAI and the local-Qwen runs on a free Kaggle T4 x2 GPU.
+`examples/quickstart.py` does the whole loop (start the recorder → write a temporary Codex config → `codex exec` a small FizzBuzz task → print one line per recorded call → re-run the task's test to check the task was really done, saved as `<session>.outcome.json`). `examples/kaggle_codex_probe.ipynb` runs everything on a free Kaggle T4 x2 GPU.
 
 ## Configuration
 
@@ -80,15 +79,16 @@ So the local model server must expose the **Responses API** (`POST /v1/responses
 
 | option | command | hardware |
 |---|---|---|
-| Ollama (used on Kaggle) | `ollama serve` then `ollama pull qwen2.5-coder:7b` | ~6 GB VRAM (4-bit) — one T4 or a recent laptop |
-| vLLM | `vllm serve Qwen/Qwen2.5-Coder-7B-Instruct --dtype half --tensor-parallel-size 2 --max-model-len 32768 --enable-auto-tool-choice --tool-call-parser hermes` | ~16 GB fp16 weights; 2× T4 or one 24 GB GPU |
+| Ollama, `qwen2.5-coder:7b` (the model named in the task) | `ollama pull qwen2.5-coder:7b` | ~5 GB VRAM (4-bit): one T4 or a laptop GPU |
+| Ollama, `qwen3-coder:30b` (MoE, 3B active) | `ollama pull qwen3-coder:30b` | ~19 GB weights (4-bit) + KV cache: 2× T4 or one 24 GB GPU |
+| vLLM | `vllm serve Qwen/Qwen2.5-Coder-7B-Instruct --dtype half --max-model-len 32768 --enable-auto-tool-choice --tool-call-parser hermes` | ~16 GB fp16 |
 
-Codex prompts are large (≈10–20k tokens of instructions and tool schema), so give the server at least a 32k context window (`OLLAMA_CONTEXT_LENGTH=32768`).
-
-Then run:
+**Give the model a 32k context.** Codex's first request is about 10k tokens (instructions + 9 tool schemas). Ollama's default context is 4k and it truncates the prompt silently; in our first run the log showed only 3,836 prompt tokens reaching the 7B model. Bake the context into the model so no server flag can be missed:
 
 ```bash
-python examples/quickstart.py --config configs/qwen_ollama.json --model qwen2.5-coder:7b --env-key OLLAMA_DUMMY_KEY
+printf 'FROM qwen2.5-coder:7b\nPARAMETER num_ctx 32768\n' > Modelfile
+ollama create qwen2.5-coder:7b-32k -f Modelfile
+python examples/quickstart.py --config configs/qwen_ollama.json --model qwen2.5-coder:7b-32k --env-key OLLAMA_API_KEY
 ```
 
 The log proves which server answered: every entry records `backend_name`, `upstream_url` (e.g. `http://127.0.0.1:11434/v1/responses`), and the `model` returned in the response body.
@@ -126,25 +126,6 @@ One JSONL line per LLM call (schema in `src/codex_probe/schema.py`, validated by
 
 Each Codex turn is one call: the request carries the **whole** running history (Codex is stateless per request: `store: false`), so call *n*'s `input` contains every earlier tool call and its output. Replaying a session means reading the JSONL top to bottom.
 
-## Analysing traces: what changes when the backend changes
-
-Recording is the means; the question is what swapping a frontier model for a 7B open model does to an agent. `codex_probe.analysis` computes, from the JSONL log alone:
-
-| Group | Metric | Why it matters |
-|---|---|---|
-| Cost | input / output tokens per turn and in total; input tokens first → last turn | Codex is stateless per request (`store: false`), so the prompt grows every turn; cost is roughly quadratic in the number of turns. |
-| Cost | **re-sent history share**: bytes of each request that are an exact repeat of the previous request's prefix | The upper bound on what prefix caching or trajectory reduction could save. |
-| Cost | input served from cache (when the backend reports `cached_tokens`) | How much of that redundancy the backend already absorbs. |
-| Latency | TTFB p50, latency p50/p95, decode tokens/s | Prefill dominates TTFB as the history grows; local serving shifts the bottleneck. |
-| Behaviour | malformed tool-call arguments; calls to tools never offered | Whether the model can use Codex's tool schema at all. |
-| Behaviour | repeated identical actions (same tool, same canonical arguments) | A cheap signal for loops, where cost grows without progress. |
-| Behaviour | text-only turns; ended with a final message | Answering instead of acting, and whether the agent terminated on its own. |
-| Outcome | `solved` from an independent re-run of the task's check | Codex's own claim of success is not trusted. |
-
-Token counts use the backend's `usage` when present and fall back to `bytes / 4` (flagged in the report). The output is a Markdown table comparing sessions side by side, a per-turn table for each session, and the full metrics as JSON.
-
-This framing follows the efficiency view of agents: the same task can cost very different amounts of computation depending on the model's behaviour (loops, malformed calls, longer trajectories), and the log makes that cost attributable turn by turn.
-
 ## How it works (design notes)
 
 - **Faithful passthrough.** The request body is forwarded byte-for-byte to `backend_base_url + <path after /v1>`. Only hop-by-hop headers (`Host`, `Content-Length`, `Connection`, …) are dropped, `Authorization` is replaced only if `api_key_env` is set, and `Accept-Encoding: identity` is sent so the relayed bytes are also readable for the log. Response bytes are relayed unchanged.
@@ -163,18 +144,29 @@ This framing follows the efficiency view of agents: the same task can cost very 
 pytest -q
 ```
 
-26 tests. The proxy tests run against an in-process mock OpenAI-compatible server (`tests/mock_backend.py`):
+18 tests. The proxy tests run against an in-process mock OpenAI-compatible server (`tests/mock_backend.py`):
 
 - passthrough round-trip, streaming and non-streaming, with byte-for-byte equality of what the client receives;
 - the stream really arrives in multiple chunks (live relay);
 - reassembly of text, parallel tool calls and fragmented arguments (Chat) and of Responses events, including truncated streams and arbitrary chunk boundaries;
-- auth injection and redaction, ordered session logs validated against the JSON schema, session rotation, upstream-down handling, client disconnect mid-stream, and config validation;
-- trace analysis: tool-schema parsing for both API shapes, malformed and unknown tool calls, repeated actions under different JSON whitespace, cache share, failed calls, missing `usage`, empty sessions, and the `analyze` CLI.
+- auth injection and redaction, ordered session logs validated against the JSON schema, session rotation, upstream-down handling, client disconnect mid-stream, and config validation.
 
 It was also checked end-to-end with the real `codex exec` (codex-cli 0.162.1) through the proxy against the mock backend.
 
+## Findings
+
+1. **`wire_api = "chat"` is gone.** Codex 0.162 refuses to start with it, so the local server must speak the Responses API. Ollama and vLLM both do.
+2. **Silent prompt truncation.** With Ollama's default 4k context, Codex's ~10k-token request was cut to 3,836 tokens before reaching Qwen. Nothing errors, and only the recorded `usage` shows it. Fixed with `num_ctx 32768` (above).
+3. **Qwen2.5-Coder-7B does not emit structured tool calls.** It writes the call as JSON inside a Markdown code block instead of the `<tool_call>` format the server parses, so Codex receives plain text, treats it as the final answer, and stops after one turn with exit code 0 while no file was created. This is the "tool-skip" failure mode described in recent tool-use failure studies. Codex's exit code therefore cannot be trusted as success; the quickstart re-runs the task's test itself.
+4. **Qwen3-Coder-30B** (trained for agentic tool use) is the same config change with a different model name; see the results table below.
+
+| backend | model | LLM calls | structured tool calls | task solved |
+|---|---|---|---|---|
+| OpenAI | gpt-5-codex | to run (needs key) | | |
+| local Ollama | qwen2.5-coder:7b-32k | see notebook | | |
+| local Ollama | qwen3-coder:30b-32k | see notebook | | |
+
 ## Known limitations
 
-- Small local models (Qwen2.5-Coder-7B) often struggle with Codex's large tool schema and multi-step tool use: malformed `function_call` arguments, answering in plain text instead of calling `exec_command`, or looping. The logs make these failures visible call by call; they are a model limitation, not a proxy one.
-- Only HTTP is proxied. Codex's optional WebSocket transport to OpenAI is not used with a custom `base_url`.
+- Only HTTP is proxied; Codex's optional WebSocket transport to OpenAI is not used with a custom `base_url`.
 - Logs store full prompts, which can include file contents from the working directory; treat them as sensitive.
